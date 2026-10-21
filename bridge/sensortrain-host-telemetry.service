@@ -1,0 +1,28 @@
+[Unit]
+Description=SensorTrain Raspberry Pi Host Telemetry
+After=network-online.target microshift.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=redhat
+Group=redhat
+
+Environment=SENSORTRAIN_BASE_URL=http://10.43.180.47:8080
+
+ExecStart=/usr/bin/python3 /usr/local/libexec/sensortrain-host-telemetry.py
+
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

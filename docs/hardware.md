@@ -5,7 +5,7 @@
 - Raspberry Pi 5
 - official Raspberry Pi 5 Active Cooler
 - 128 GB 2242 NVMe SSD on M.2 HAT
-- Raspberry Pi Pico 2 W
+- Raspberry Pi Pico 2 (non-W)
 - two approximately 30 x 30 x 7 mm Easycargo fans
 - MOSFET fan drivers
 - USB UVC camera retained for the project
@@ -41,9 +41,9 @@ Production ROM assignments:
 - `28:CA:D0:23:0D:00:00:F8` — EXHAUST
 - `28:44:9D:23:0D:00:00:04` — COMPUTE
 
-### DRV5032
+### QTR-HD-01RC
 
-Hall-effect sensor used as a digital active-low input.
+Pololu reflective wheel marker sensor, connected to GP3. It replaces the earlier Hall sensor.
 
 ## Pico pin assignments
 
@@ -52,7 +52,7 @@ Current production firmware uses:
 - GP0 — I2C SDA
 - GP1 — I2C SCL
 - GP2 — 1-Wire bus
-- GP3 — Hall sensor
+- GP3 — QTR wheel marker sensor
 - GP6 — intake fan PWM
 - GP7 — exhaust fan PWM
 
@@ -64,7 +64,7 @@ The compute car is powered from a USB-C power bank carried in the third car. The
 
 ## Connectors and fabrication
 
-The project uses locking JST-XH connectors for removable sensor/fan connections. The final carrier-board plan is a socketed Pico 2 W carrier with JST-XH headers and integrated fan-driver circuitry.
+The project uses locking JST-XH connectors for removable sensor/fan connections. The validated Rev C carrier uses a socketed Pico 2 (non-W), JST-XH headers, and external MOSFET fan-driver boards.
 
 The enclosure/mechanical work is intended for a Bambu Lab P1S. M2.5 heat-set inserts and M2.5/M3 hardware are available for printed structural parts.
 

@@ -18,3 +18,11 @@ sensortrain-bridge.sysconfig
 # CircuitPython filesystem noise
 .Trashes
 .fseventsd/
+pico/code.py.v0.3.0-backup
+esp32-c3/build/
+esp32-c3/sdkconfig
+esp32-c3/sdkconfig.old
+esp32-c3/sdkconfig.private
+**/kubeconfig
+*.key
+*.pem

@@ -47,7 +47,7 @@ See `bridge/sensortrain-bridge.env.example` for the expected variables.
 
 ## Local route
 
-The included route uses `sensortrain.test`. In the accepted v1.0 installation the client resolves that name to the Raspberry Pi LAN address through a local hosts/DNS entry.
+The included Route manifest retains the historical `sensortrain.test` hostname. The current train is accessed locally at `http://sensortrain.local`. These names require their own appropriate routing and name resolution; verify the environment before applying the example Route.
 
 ## Security
 

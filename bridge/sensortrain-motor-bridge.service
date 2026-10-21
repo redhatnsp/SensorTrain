@@ -1,0 +1,29 @@
+[Unit]
+Description=SensorTrain ESP32 Motor Bridge
+After=network-online.target microshift.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+User=redhat
+Group=redhat
+SupplementaryGroups=dialout
+
+EnvironmentFile=/etc/sysconfig/sensortrain-motor-bridge
+
+ExecStart=/usr/bin/python3 /usr/local/libexec/sensortrain-motor-bridge.py
+
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

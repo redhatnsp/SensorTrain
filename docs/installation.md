@@ -6,7 +6,7 @@ This document describes the v1.0 application and bridge installation on an alrea
 
 - Raspberry Pi 5 running the validated RHEL/MicroShift platform
 - MicroShift running and `oc` configured
-- Raspberry Pi Pico 2 W running CircuitPython 10.2.1
+- Raspberry Pi Pico 2 (non-W) running CircuitPython 10.2.1
 - repository checked out on the Pi
 
 ## 1. Install Pico firmware
@@ -102,7 +102,7 @@ oc get pods -n sensortrain
 oc get route sensortrain -n sensortrain
 ```
 
-The accepted local route is `sensortrain.test`. Configure local DNS or a hosts entry so that name resolves to the Raspberry Pi LAN address.
+The original September deployment used the `sensortrain.test` Route. The current train is accessed locally at `http://sensortrain.local`. Verify the active network and route configuration before reusing the historical manifest.
 
 ## 6. Validate controls
 
@@ -127,3 +127,16 @@ The dashboard HTML is embedded/served by the current v1.0 server implementation.
 ## Expected restart behavior
 
 The v1.0 server keeps telemetry history and desired fan state only in memory. Restarting/replacing the web pod clears both. This is intentional and not a recovery failure.
+
+## Current GA additions
+
+The current platform also runs the ESP32-C3 motor controller,
+the motor bridge, host telemetry, and shutdown-agent services.
+
+Install these from the reviewed files under `esp32-c3/` and
+`bridge/`. Their runtime configuration must be checked against
+the target hardware before enabling them.
+
+The current Pico 2 uses USB communications, not Pico Wi-Fi.
+Red Hat Flight Control enrollment credentials are configured
+outside this public repository.

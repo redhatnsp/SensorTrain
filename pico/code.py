@@ -1,6 +1,7 @@
 import time
 import json
 import sys
+import math
 import supervisor
 import board
 import pwmio
@@ -19,20 +20,33 @@ import adafruit_ds18x20
 
 
 # ==================================================
-# SensorTrain Pico 2 W telemetry firmware
+# SensorTrain Pico 2 telemetry firmware
 # ==================================================
 
-FIRMWARE_VERSION = "0.3.0"
+FIRMWARE_VERSION = "0.4.1"
+
 
 # Known DS18B20 ROM identities
 COMPUTE_ROM = "28:44:9D:23:0D:00:00:04"
 EXHAUST_ROM = "28:CA:D0:23:0D:00:00:F8"
+
+
+# Wheel geometry
+WHEEL_DIAMETER_M = 0.023
+WHEEL_CIRCUMFERENCE_M = math.pi * WHEEL_DIAMETER_M
+
 
 boot_errors = []
 
 
 def rom_string(device):
     return ":".join("{:02X}".format(byte) for byte in device.rom)
+
+
+def rounded(value, digits=3):
+    if value is None:
+        return None
+    return round(value, digits)
 
 
 # --------------------------------------------------
@@ -43,6 +57,7 @@ def rom_string(device):
 
 i2c = busio.I2C(board.GP1, board.GP0)
 
+
 bno = None
 try:
     bno = BNO08X_I2C(i2c)
@@ -51,6 +66,7 @@ try:
     bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
 except Exception as exc:
     boot_errors.append("bno085_init:" + str(exc))
+
 
 bme = None
 try:
@@ -65,6 +81,10 @@ except Exception as exc:
 # --------------------------------------------------
 # DS18B20
 # GP2
+#
+# Temperature conversions are started asynchronously so
+# the wheel sensor can continue being serviced while the
+# DS18B20s are converting.
 # --------------------------------------------------
 
 ow_bus = OneWireBus(board.GP2)
@@ -100,15 +120,191 @@ except Exception as exc:
     boot_errors.append("ds18b20_init:" + str(exc))
 
 
+DS_UPDATE_SECONDS = 2.0
+
+compute_c = None
+exhaust_c = None
+
+ds_conversion_active = False
+ds_conversion_ready_at = 0.0
+ds_next_start_at = 0.0
+ds_last_error = None
+
+
+def start_ds_conversion(now):
+    global ds_conversion_active
+    global ds_conversion_ready_at
+    global ds_next_start_at
+    global ds_last_error
+
+    max_delay = 0.0
+    started = False
+
+    try:
+        for sensor in ds_sensors.values():
+            if sensor is None:
+                continue
+
+            delay = sensor.start_temperature_read()
+            if delay > max_delay:
+                max_delay = delay
+            started = True
+
+        if started:
+            ds_conversion_active = True
+            ds_conversion_ready_at = now + max_delay
+        else:
+            ds_next_start_at = now + DS_UPDATE_SECONDS
+
+        ds_last_error = None
+
+    except Exception as exc:
+        ds_conversion_active = False
+        ds_next_start_at = now + DS_UPDATE_SECONDS
+        ds_last_error = "ds18b20_convert:" + str(exc)
+
+
+def service_ds_temperatures(now):
+    global compute_c
+    global exhaust_c
+    global ds_conversion_active
+    global ds_next_start_at
+    global ds_last_error
+
+    if not ds_conversion_active:
+        if now >= ds_next_start_at:
+            start_ds_conversion(now)
+        return
+
+    if now < ds_conversion_ready_at:
+        return
+
+    errors = []
+
+    if ds_sensors["compute"] is not None:
+        try:
+            compute_c = rounded(
+                ds_sensors["compute"].read_temperature(), 2
+            )
+        except Exception as exc:
+            errors.append("compute:" + str(exc))
+
+    if ds_sensors["exhaust"] is not None:
+        try:
+            exhaust_c = rounded(
+                ds_sensors["exhaust"].read_temperature(), 2
+            )
+        except Exception as exc:
+            errors.append("exhaust:" + str(exc))
+
+    ds_conversion_active = False
+    ds_next_start_at = now + DS_UPDATE_SECONDS
+
+    if errors:
+        ds_last_error = "ds18b20_read:" + ",".join(errors)
+    else:
+        ds_last_error = None
+
+
 # --------------------------------------------------
-# Hall sensor
-# GP3
-# Active-low
+# QTR-HD-01RC wheel reflectance sensor
+# GP3 = OUT
+# CTRL is intentionally left unconnected on Rev C.
+#
+# Measured on this installation:
+# reflective aluminum marker: ~61-150 us
+# black/no target: 5000 us timeout
+#
+# Hysteresis:
+# marker detected below 500 us
+# marker cleared at/above 1000 us
 # --------------------------------------------------
 
-hall = digitalio.DigitalInOut(board.GP3)
-hall.direction = digitalio.Direction.INPUT
-hall.pull = digitalio.Pull.UP
+ir = digitalio.DigitalInOut(board.GP3)
+
+IR_CHARGE_SECONDS = 0.00002
+IR_DETECT_US = 500
+IR_CLEAR_US = 1000
+IR_FULL_TIMEOUT_US = 5000
+IR_MIN_EVENT_SECONDS = 0.030
+WHEEL_STOP_TIMEOUT_SECONDS = 3.0
+
+wheel_marker_active = False
+wheel_count = 0
+wheel_last_event_at = None
+wheel_period_s = None
+wheel_rpm = 0.0
+wheel_speed_mps = 0.0
+wheel_last_raw_us = IR_FULL_TIMEOUT_US
+
+
+def read_ir_rc(timeout_us):
+    ir.switch_to_output(value=True)
+    time.sleep(IR_CHARGE_SECONDS)
+
+    ir.switch_to_input()
+
+    start_ns = time.monotonic_ns()
+
+    while ir.value:
+        elapsed_us = (time.monotonic_ns() - start_ns) // 1000
+
+        if elapsed_us >= timeout_us:
+            return timeout_us
+
+    return (time.monotonic_ns() - start_ns) // 1000
+
+
+def register_wheel_event(now):
+    global wheel_count
+    global wheel_last_event_at
+    global wheel_period_s
+    global wheel_rpm
+    global wheel_speed_mps
+
+    if wheel_last_event_at is not None:
+        interval = now - wheel_last_event_at
+
+        if interval < IR_MIN_EVENT_SECONDS:
+            return
+
+        wheel_period_s = interval
+        wheel_rpm = 60.0 / interval
+        wheel_speed_mps = WHEEL_CIRCUMFERENCE_M / interval
+
+    wheel_last_event_at = now
+    wheel_count += 1
+
+
+def service_wheel_sensor():
+    global wheel_marker_active
+
+    if wheel_marker_active:
+        value_us = read_ir_rc(IR_CLEAR_US)
+
+        if value_us >= IR_CLEAR_US:
+            wheel_marker_active = False
+
+    else:
+        value_us = read_ir_rc(IR_DETECT_US)
+
+        if value_us < IR_DETECT_US:
+            wheel_marker_active = True
+            register_wheel_event(time.monotonic())
+
+
+def service_wheel_stopped(now):
+    global wheel_rpm
+    global wheel_speed_mps
+    global wheel_period_s
+
+    if wheel_last_event_at is None:
+        return
+
+    if now - wheel_last_event_at >= WHEEL_STOP_TIMEOUT_SECONDS:
+        wheel_rpm = 0.0
+        wheel_speed_mps = 0.0
+        wheel_period_s = None
 
 
 # --------------------------------------------------
@@ -148,12 +344,21 @@ intake_fan_pct = 0
 exhaust_fan_pct = 0
 
 
+def fan_startup_kick(fan):
+    fan.duty_cycle = fan_duty(100)
+
+    end_at = time.monotonic() + FAN_STARTUP_KICK_SECONDS
+
+    while time.monotonic() < end_at:
+        service_wheel_sensor()
+        service_wheel_stopped(time.monotonic())
+
+
 def set_fan_level(
     fan,
     current_pct,
     requested_pct
 ):
-
     if type(requested_pct) is not int:
         raise ValueError(
             "fan percentage must be an integer"
@@ -168,8 +373,7 @@ def set_fan_level(
     # 25% sustains rotation but does not reliably
     # start either fan from a dead stop.
     if current_pct == 0 and requested_pct == 25:
-        fan.duty_cycle = fan_duty(100)
-        time.sleep(FAN_STARTUP_KICK_SECONDS)
+        fan_startup_kick(fan)
 
     fan.duty_cycle = fan_duty(
         requested_pct
@@ -184,6 +388,7 @@ def set_fan_level(
 # Commands are newline-delimited JSON, for example:
 #
 # {"command":"fans","intake":true,"exhaust":false}
+# {"command":"fans","intake_pct":25,"exhaust_pct":50}
 #
 # --------------------------------------------------
 
@@ -191,7 +396,6 @@ command_buffer = ""
 
 
 def apply_command(command):
-
     global intake_fan_pct
     global exhaust_fan_pct
 
@@ -200,11 +404,9 @@ def apply_command(command):
             "unsupported command"
         )
 
-
     # Preferred percentage-based control.
 
     if "intake_pct" in command:
-
         intake_fan_pct = set_fan_level(
             intake_fan,
             intake_fan_pct,
@@ -214,7 +416,6 @@ def apply_command(command):
     # Legacy boolean compatibility for current bridge.
 
     elif "intake" in command:
-
         if type(command["intake"]) is not bool:
             raise ValueError(
                 "intake must be boolean"
@@ -230,9 +431,7 @@ def apply_command(command):
             requested
         )
 
-
     if "exhaust_pct" in command:
-
         exhaust_fan_pct = set_fan_level(
             exhaust_fan,
             exhaust_fan_pct,
@@ -240,7 +439,6 @@ def apply_command(command):
         )
 
     elif "exhaust" in command:
-
         if type(command["exhaust"]) is not bool:
             raise ValueError(
                 "exhaust must be boolean"
@@ -307,28 +505,25 @@ def process_serial_commands():
 
 
 # --------------------------------------------------
-# Telemetry helpers
+# Telemetry
 # --------------------------------------------------
-
-def rounded(value, digits=3):
-    if value is None:
-        return None
-    return round(value, digits)
-
 
 seq = 0
+TELEMETRY_SECONDS = 1.0
+next_telemetry_at = time.monotonic()
 
 
-# --------------------------------------------------
-# Main telemetry loop
-# --------------------------------------------------
-
-while True:
-    process_serial_commands()
+def emit_telemetry():
+    global seq
+    global wheel_last_raw_us
 
     errors = list(boot_errors)
 
+    if ds_last_error is not None:
+        errors.append(ds_last_error)
+
     # ---------- Environment ----------
+
     ambient_c = None
     humidity_pct = None
     pressure_hpa = None
@@ -341,8 +536,8 @@ while True:
         except Exception as exc:
             errors.append("bme280_read:" + str(exc))
 
-
     # ---------- Motion ----------
+
     accel_x = None
     accel_y = None
     accel_z = None
@@ -382,33 +577,13 @@ while True:
         except Exception as exc:
             errors.append("bno085_quaternion:" + str(exc))
 
+    # ---------- Wheel / IR ----------
 
-    # ---------- DS18B20 ----------
-    compute_c = None
-    exhaust_c = None
+    try:
+        wheel_last_raw_us = read_ir_rc(IR_FULL_TIMEOUT_US)
+    except Exception as exc:
+        errors.append("wheel_ir_read:" + str(exc))
 
-    if ds_sensors["compute"] is not None:
-        try:
-            compute_c = rounded(
-                ds_sensors["compute"].temperature, 2
-            )
-        except Exception as exc:
-            errors.append("ds18b20_compute_read:" + str(exc))
-
-    if ds_sensors["exhaust"] is not None:
-        try:
-            exhaust_c = rounded(
-                ds_sensors["exhaust"].temperature, 2
-            )
-        except Exception as exc:
-            errors.append("ds18b20_exhaust_read:" + str(exc))
-
-
-    # ---------- Hall ----------
-    hall_active = not hall.value
-
-
-    # ---------- Assemble telemetry ----------
     telemetry = {
         "schema": "sensortrain.telemetry.v1",
         "firmware": FIRMWARE_VERSION,
@@ -443,8 +618,16 @@ while True:
             "quat_real": quat_real,
         },
 
-        "hall": {
-            "active": hall_active,
+        "wheel": {
+            "marker_active": wheel_marker_active,
+            "rc_us": wheel_last_raw_us,
+            "count": wheel_count,
+            "period_s": rounded(wheel_period_s, 4),
+            "rpm": rounded(wheel_rpm, 1),
+            "speed_mps": rounded(wheel_speed_mps, 3),
+            "distance_m": rounded(
+                wheel_count * WHEEL_CIRCUMFERENCE_M, 3
+            ),
         },
 
         "fans": {
@@ -458,4 +641,31 @@ while True:
     print(json.dumps(telemetry))
 
     seq += 1
-    time.sleep(1)
+
+
+# --------------------------------------------------
+# Main service loop
+#
+# No one-second sleep here: the QTR RC sensor must be
+# sampled continuously so wheel events are not missed.
+# --------------------------------------------------
+
+while True:
+    process_serial_commands()
+
+    service_wheel_sensor()
+
+    now = time.monotonic()
+
+    service_wheel_stopped(now)
+    service_ds_temperatures(now)
+
+    if now >= next_telemetry_at:
+        emit_telemetry()
+
+        next_telemetry_at += TELEMETRY_SECONDS
+
+        # If a long operation ever puts us more than one interval
+        # behind, resume from "now" instead of flooding catch-up frames.
+        if next_telemetry_at <= now:
+            next_telemetry_at = now + TELEMETRY_SECONDS
