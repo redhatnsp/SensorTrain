@@ -1,0 +1,1 @@
+SUBSYSTEM=="tty", KERNEL=="ttyACM*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="REPLACE_WITH_ESP32_USB_SERIAL", SYMLINK+="sensortrain-motor", GROUP="dialout", MODE="0660"

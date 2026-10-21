@@ -1,4 +1,3 @@
-# /etc/systemd/system/sensortrain-bridge.service
 [Unit]
 Description=SensorTrain Pico Telemetry Bridge
 After=network-online.target microshift.service

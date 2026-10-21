@@ -1,14 +1,14 @@
 # SensorTrain architecture
 
-SensorTrain separates physical I/O from application hosting so that real-time-ish sensor and fan handling remains on the Pico 2 W while Linux/MicroShift handles transport, presentation, and platform health.
+SensorTrain separates physical I/O from application hosting so that real-time-ish sensor and fan handling remains on the Pico 2 (non-W) while Linux/MicroShift handles transport, presentation, and platform health.
 
 ## Data path
 
 ```text
 BNO085 ─┐
-BME280 ─┼─> Raspberry Pi Pico 2 W ── USB serial / NDJSON ──> host bridge
+BME280 ─┼─> Raspberry Pi Pico 2 (non-W) ── USB serial / NDJSON ──> host bridge
 DS18B20 ┤                                                   |
-DRV5032 ┘                                                   | HTTP
+QTR-HD-01RC ┘                                                   | HTTP
 Fans <────────────── control ACK / commands <───────────────┘
                                                             |
                                                             v
@@ -19,13 +19,13 @@ Fans <────────────── control ACK / commands <──�
                                                     browser dashboard
 ```
 
-## Pico 2 W
+## Pico 2 (non-W)
 
 The Pico runs CircuitPython and owns the physical interfaces:
 
 - BNO085 and BME280 on shared I2C
 - two DS18B20 probes on one 1-Wire bus
-- DRV5032 Hall sensor
+- QTR-HD-01RC wheel marker sensor
 - two MOSFET-driven fans
 
 Telemetry is emitted as newline-delimited JSON using schema `sensortrain.telemetry.v1`. Fan control commands are accepted over the same serial connection and acknowledged with `sensortrain.control.ack.v1`.
@@ -75,3 +75,17 @@ This distinction allows the dashboard to show, for example, a healthy bridge and
 History is intentionally non-persistent in v1.0. A bounded in-memory deque retains approximately 45–50 minutes at the current telemetry cadence. The dashboard offers 1, 5, 10, 20, and 30 minute views.
 
 Pod replacement therefore clears graph history and desired fan state. This behavior was explicitly accepted for the v1.0 release.
+
+## Current motor-control architecture
+
+A separate ESP32-C3 connects over USB to the Pi motor bridge.
+It controls the designated LEGO Powered Up hub over Bluetooth LE.
+
+The ESP32-C3 implements a one-second heartbeat failsafe,
+automatic BLE reconnection, and restart at zero motor speed.
+
+Additional host services collect Pi telemetry and process
+authorized host-shutdown requests.
+
+The running application includes main, tablet, and admin pages.
+A second motor hub for a powered caboose is planned, not deployed.
