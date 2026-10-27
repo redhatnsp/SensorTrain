@@ -1267,21 +1267,126 @@ static void ble_host_task(void *param)
  * LEGO train motor control
  * --------------------------------------------------------- */
 
+/*
+ * SENSORTRAIN_V12_PER_HUB_MOTOR_CALLBACK
+ *
+ * Identify the hub associated with each BLE write result.
+ * A successful callback confirms the BLE write completed,
+ * not that a physical motor has stopped or moved.
+ */
 static int motor_write_cb(
     uint16_t conn_handle,
     const struct ble_gatt_error *error,
     struct ble_gatt_attr *attr,
     void *arg)
 {
-    if (error->status == 0) {
-        printf("MOTOR COMMAND SENT\n");
-    } else {
-        printf("ERROR MOTOR WRITE status=%d\n",
-               error->status);
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (hub == &hub_states[HUB_LOCOMOTIVE] ||
+        hub == &hub_states[HUB_CABOOSE]) {
+
+        if (error->status == 0) {
+
+            printf("%s: MOTOR COMMAND SENT conn=%u\n",
+                   hub->config->role,
+                   (unsigned)conn_handle);
+        }
+        else {
+
+            printf("%s: ERROR MOTOR WRITE status=%d conn=%u\n",
+                   hub->config->role,
+                   error->status,
+                   (unsigned)conn_handle);
+        }
+    }
+    else {
+
+        /*
+         * Preserve legacy callback output for callers
+         * that do not supply a hub context.
+         */
+        if (error->status == 0) {
+
+            printf("MOTOR COMMAND SENT\n");
+        }
+        else {
+
+            printf("ERROR MOTOR WRITE status=%d\n",
+                   error->status);
+        }
     }
 
     return 0;
 }
+
+/*
+ * SENSORTRAIN_V12_PER_HUB_MOTOR_OUTPUT
+ *
+ * Submit a motor command to one specific LEGO hub.
+ *
+ * During development, only zero power is permitted.
+ * Motor directions have not yet been calibrated.
+ */
+static bool send_motor_power_to_hub(
+    sensortrain_hub_state_t *hub,
+    int power)
+{
+    if (hub != &hub_states[HUB_LOCOMOTIVE] &&
+        hub != &hub_states[HUB_CABOOSE]) {
+
+        printf("ERROR INVALID MOTOR HUB\n");
+        return false;
+    }
+
+    if (power < -100 || power > 100) {
+        printf("ERROR POWER RANGE\n");
+        return false;
+    }
+
+    /*
+     * Independent development safety interlock.
+     * Never permit movement at this stage.
+     */
+    if (power != 0) {
+        printf("%s: ERROR DUAL_MOTOR_CONTROL_NOT_READY\n",
+               hub->config->role);
+        return false;
+    }
+
+    if (!hub->connected ||
+        !hub->gatt_ready ||
+        hub->characteristic_handle == 0) {
+
+        printf("%s: ERROR HUB NOT READY\n",
+               hub->config->role);
+        return false;
+    }
+
+    uint8_t command[8] = {
+        0x08, 0x00, 0x81, 0x00,
+        0x11, 0x51, 0x00,
+        (uint8_t)(int8_t)power
+    };
+
+    int rc = ble_gattc_write_flat(
+        hub->conn_handle,
+        hub->characteristic_handle,
+        command,
+        sizeof(command),
+        motor_write_cb,
+        hub
+    );
+
+    if (rc != 0) {
+        printf("%s: ERROR MOTOR WRITE START rc=%d\n",
+               hub->config->role, rc);
+        return false;
+    }
+
+    return true;
+}
+
 
 static bool lego_set_power(int power)
 {
@@ -1376,29 +1481,99 @@ static void stop_all_connected_motors(const char *reason)
             continue;
         }
 
-        uint8_t command[8] = {
-            0x08, 0x00, 0x81, 0x00,
-            0x11, 0x51, 0x00, 0x00
-        };
+        if (send_motor_power_to_hub(hub, 0)) {
 
-        int rc = ble_gattc_write_flat(
-            hub->conn_handle,
-            hub->characteristic_handle,
-            command,
-            sizeof(command),
-            motor_write_cb,
-            hub
-        );
-
-        if (rc != 0) {
-            printf("%s: ERROR STOP SUBMISSION rc=%d\n",
-                   hub->config->role, rc);
-        }
-        else {
             printf("%s: STOP COMMAND SUBMITTED\n",
                    hub->config->role);
         }
+        else {
+
+            printf("%s: ERROR STOP SUBMISSION\n",
+                   hub->config->role);
+        }
     }
+}
+
+
+/*
+ * SENSORTRAIN_V12_DUAL_READINESS
+ *
+ * Check both BLE links and calibrated motor directions.
+ * This is NOT permission to enable movement.
+ */
+static bool dual_hubs_configured_and_ready(void)
+{
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+        const sensortrain_hub_state_t *hub = &hub_states[i];
+
+        if (!hub->connected ||
+            !hub->gatt_ready ||
+            !hub->notifications_ready ||
+            hub->characteristic_handle == 0) {
+            return false;
+        }
+
+        if (hub->config->forward_sign != 1 &&
+            hub->config->forward_sign != -1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+/*
+ * SENSORTRAIN_V12_DUAL_SPEED_PLANNER
+ *
+ * Development mode: calculate intended motor directions,
+ * but NEVER submit nonzero power to either hub.
+ */
+static bool dispatch_dual_motor_speed(int speed)
+{
+    if (speed < -100 || speed > 100) {
+        printf("ERROR SPEED_RANGE\n");
+        return false;
+    }
+
+    if (speed == 0) {
+        stop_all_connected_motors("SPEED ZERO");
+        printf("SPEED 0\n");
+        return true;
+    }
+
+    if (!dual_hubs_configured_and_ready()) {
+
+        printf("ERROR DUAL_MOTOR_PAIR_NOT_READY\n");
+
+    } else {
+
+        int locomotive_power =
+            speed *
+            hub_states[HUB_LOCOMOTIVE].config->forward_sign;
+
+        int caboose_power =
+            speed *
+            hub_states[HUB_CABOOSE].config->forward_sign;
+
+        printf(
+            "DUALPLAN LOCOMOTIVE=%d CABOOSE=%d "
+            "MOTION=LOCKED\n",
+            locomotive_power,
+            caboose_power
+        );
+    }
+
+    /*
+     * HARD DEVELOPMENT INTERLOCK.
+     *
+     * Planning is not permission to move.
+     * Do not call either motor-output function here.
+     */
+    printf("ERROR DUAL_MOTOR_CONTROL_NOT_READY\n");
+
+    return false;
 }
 
 
@@ -1421,6 +1596,31 @@ static void process_command(const char *line)
             lego_notifications_ready ?
                 "READY" : "NOT_READY",
             hub_battery_percent
+        );
+    }
+
+    else if (strcmp(line, "DUALSTATUS") == 0) {
+
+        for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+            const sensortrain_hub_state_t *hub =
+                &hub_states[i];
+
+            printf(
+                "DUALSTATUS %s CONNECTED=%s GATT=%s "
+                "NOTIFY=%s SIGN=%d BATTERY=%d\n",
+                hub->config->role,
+                hub->connected ? "YES" : "NO",
+                hub->gatt_ready ? "READY" : "NOT_READY",
+                hub->notifications_ready ? "READY" : "NOT_READY",
+                (int)hub->config->forward_sign,
+                hub->battery_percent
+            );
+        }
+
+        printf(
+            "DUALSTATUS PAIR_READY=%s MOTION=LOCKED\n",
+            dual_hubs_configured_and_ready() ? "YES" : "NO"
         );
     }
 
@@ -1458,21 +1658,20 @@ static void process_command(const char *line)
 
     else if (strncmp(line, "SPEED ", 6) == 0) {
 
-        int speed = atoi(line + 6);
+        char *endptr = NULL;
+        long value = strtol(line + 6, &endptr, 10);
 
-        if (speed < -100 || speed > 100) {
+        if (endptr == line + 6 || *endptr != '\0') {
+
+            printf("ERROR INVALID_SPEED\n");
+
+        } else if (value < -100 || value > 100) {
 
             printf("ERROR SPEED_RANGE\n");
-        }
-        else {
 
-            if (lego_set_power(speed)) {
-                requested_speed = speed;
-                last_heartbeat_us = esp_timer_get_time();
+        } else {
 
-                printf("SPEED %d\n",
-                       requested_speed);
-            }
+            dispatch_dual_motor_speed((int)value);
         }
     }
 
