@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,6 +23,27 @@
 #include "sensortrain_hubs.h"
 
 static int requested_speed = 0;
+
+/*
+ * SENSORTRAIN_V12_FAULT_LATCH
+ *
+ * A serious fault remains latched until ESP32 restart.
+ * Reconnection never automatically restores permission
+ * to run a motor.
+ *
+ * This latch is additional protection, NOT proof that
+ * a STOP command physically stopped a motor.
+ */
+static atomic_bool safety_fault_latched =
+    ATOMIC_VAR_INIT(false);
+
+static void latch_safety_fault(const char *reason)
+{
+    if (!atomic_exchange(&safety_fault_latched, true)) {
+        printf("SAFETY FAULT LATCHED: %s\n", reason);
+    }
+}
+
 
 static int64_t last_heartbeat_us = 0;
 
@@ -937,6 +959,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
              * Stop the other reachable motor whenever
              * either connection is lost.
              */
+            latch_safety_fault("BLE HUB DISCONNECTED");
             stop_all_connected_motors("BLE HUB DISCONNECTED");
 
             if (hub == &hub_states[HUB_LOCOMOTIVE]) {
@@ -1123,6 +1146,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                             hub->config->role
                         );
 
+                        latch_safety_fault(
+                            "MOTOR PORT0 DETACHED"
+                        );
+
                         stop_all_connected_motors(
                             "MOTOR PORT0 DETACHED"
                         );
@@ -1282,6 +1309,7 @@ static void connect_to_configured_hub(
 
 static void ble_on_reset(int reason)
 {
+    latch_safety_fault("BLE STACK RESET");
     ble_ready = false;
     printf("BLE RESET reason=%d\n", reason);
 }
@@ -1349,6 +1377,8 @@ static int motor_write_cb(
         }
         else {
 
+            latch_safety_fault("MOTOR BLE WRITE FAILED");
+
             printf("%s: ERROR MOTOR WRITE status=%d conn=%u\n",
                    hub->config->role,
                    error->status,
@@ -1403,6 +1433,13 @@ static bool send_motor_power_to_hub(
      * Independent development safety interlock.
      * Never permit movement at this stage.
      */
+    if (power != 0 &&
+        atomic_load(&safety_fault_latched)) {
+
+        printf("ERROR SAFETY_FAULT_LATCHED\n");
+        return false;
+    }
+
     if (power != 0) {
         printf("%s: ERROR DUAL_MOTOR_CONTROL_NOT_READY\n",
                hub->config->role);
@@ -1434,6 +1471,8 @@ static bool send_motor_power_to_hub(
     );
 
     if (rc != 0) {
+        latch_safety_fault("MOTOR WRITE SUBMISSION FAILED");
+
         printf("%s: ERROR MOTOR WRITE START rc=%d\n",
                hub->config->role, rc);
         return false;
@@ -1492,6 +1531,112 @@ static void stop_all_connected_motors(const char *reason)
 
 
 /*
+ * SENSORTRAIN_V12_CAL_WATCHDOG
+ *
+ * Independent calibration deadline.
+ *
+ * The ESP timer callback only notifies a safety task.
+ * BLE STOP commands run from the safety task, not
+ * the timer callback or serial command loop.
+ *
+ * No calibration movement is enabled here.
+ */
+#define CAL_WATCHDOG_MAX_US 500000
+
+static TaskHandle_t cal_watchdog_task_handle = NULL;
+static esp_timer_handle_t cal_watchdog_timer = NULL;
+
+static atomic_bool cal_watchdog_expired =
+    ATOMIC_VAR_INIT(false);
+
+/* Prevent repeated watchdog self-tests. */
+static atomic_bool cal_watchdog_test_used =
+    ATOMIC_VAR_INIT(false);
+
+
+static void cal_watchdog_timer_cb(void *arg)
+{
+    (void)arg;
+
+    atomic_store(&cal_watchdog_expired, true);
+
+    if (cal_watchdog_task_handle != NULL) {
+        xTaskNotifyGive(cal_watchdog_task_handle);
+    }
+}
+
+
+static void cal_watchdog_safety_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (atomic_exchange(
+                &cal_watchdog_expired, false)) {
+
+            latch_safety_fault(
+                "CALIBRATION WATCHDOG EXPIRED"
+            );
+
+            stop_all_connected_motors(
+                "CALIBRATION WATCHDOG EXPIRED"
+            );
+        }
+    }
+}
+
+
+static bool initialize_calibration_watchdog(void)
+{
+    BaseType_t task_rc = xTaskCreate(
+        cal_watchdog_safety_task,
+        "cal_watchdog",
+        4096,
+        NULL,
+        6,
+        &cal_watchdog_task_handle
+    );
+
+    if (task_rc != pdPASS) {
+
+        latch_safety_fault(
+            "CALIBRATION WATCHDOG TASK FAILED"
+        );
+
+        return false;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = cal_watchdog_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "sensortrain_cal"
+    };
+
+    esp_err_t timer_rc = esp_timer_create(
+        &timer_args,
+        &cal_watchdog_timer
+    );
+
+    if (timer_rc != ESP_OK) {
+
+        latch_safety_fault(
+            "CALIBRATION WATCHDOG TIMER FAILED"
+        );
+
+        return false;
+    }
+
+    printf("CALIBRATION WATCHDOG INITIALIZED\n");
+
+    return true;
+}
+
+
+/*
  * SENSORTRAIN_V12_DUAL_READINESS
  *
  * Check both BLE links and calibrated motor directions.
@@ -1537,6 +1682,11 @@ static bool dispatch_dual_motor_speed(int speed)
         stop_all_connected_motors("SPEED ZERO");
         printf("SPEED 0\n");
         return true;
+    }
+
+    if (atomic_load(&safety_fault_latched)) {
+        printf("ERROR SAFETY_FAULT_LATCHED\n");
+        return false;
     }
 
     if (!dual_hubs_configured_and_ready()) {
@@ -1592,6 +1742,15 @@ static void process_command(const char *line)
             lego_notifications_ready ?
                 "READY" : "NOT_READY",
             hub_battery_percent
+        );
+    }
+
+    else if (strcmp(line, "SAFETYSTATUS") == 0) {
+
+        printf(
+            "SAFETYSTATUS LATCHED=%s MOTION=LOCKED\n",
+            atomic_load(&safety_fault_latched) ?
+                "YES" : "NO"
         );
     }
 
@@ -1655,6 +1814,86 @@ static void process_command(const char *line)
             "CALSTATUS PRECHECK=%s MOTION=LOCKED\n",
             precheck ? "YES" : "NO"
         );
+    }
+
+    else if (strcmp(line, "CALWATCHDOGTEST") == 0) {
+
+        /*
+         * SENSORTRAIN_V12_CAL_WATCHDOG_SELFTEST
+         *
+         * This diagnostic never sends nonzero motor power.
+         * Both hubs must be ready and both motors absent.
+         *
+         * A successful test intentionally latches a fault.
+         * Restart the ESP32 before further testing.
+         */
+        bool ready =
+            cal_watchdog_timer != NULL &&
+            cal_watchdog_task_handle != NULL &&
+            requested_speed == 0;
+
+        for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+            const sensortrain_hub_state_t *hub =
+                &hub_states[i];
+
+            if (!hub->connected ||
+                !hub->gatt_ready ||
+                !hub->notifications_ready ||
+                hub->characteristic_handle == 0 ||
+                hub->motor_port0_present) {
+
+                ready = false;
+            }
+        }
+
+        if (atomic_load(&safety_fault_latched)) {
+
+            printf("ERROR CALWATCHDOGTEST_FAULT_LATCHED\n");
+        }
+        else if (!ready) {
+
+            printf("ERROR CALWATCHDOGTEST_PRECHECK\n");
+        }
+        else if (atomic_exchange(
+                     &cal_watchdog_test_used, true)) {
+
+            printf("ERROR CALWATCHDOGTEST_ALREADY_USED\n");
+        }
+        else {
+
+            /*
+             * Arm a 100 ms deadline for the self-test.
+             * The safety task handles expiry separately.
+             */
+            esp_err_t rc = esp_timer_start_once(
+                cal_watchdog_timer,
+                100000
+            );
+
+            if (rc != ESP_OK) {
+
+                latch_safety_fault(
+                    "CALWATCHDOGTEST ARM FAILED"
+                );
+
+                stop_all_connected_motors(
+                    "CALWATCHDOGTEST ARM FAILED"
+                );
+
+                printf(
+                    "ERROR CALWATCHDOGTEST_ARM rc=%d\n",
+                    (int)rc
+                );
+            }
+            else {
+
+                printf(
+                    "CALWATCHDOGTEST ARMED 100ms "
+                    "MOTION=LOCKED\n"
+                );
+            }
+        }
     }
 
     else if (strcmp(line, "SCAN") == 0) {
@@ -1734,6 +1973,10 @@ void app_main(void)
     nimble_port_freertos_init(
         ble_host_task
     );
+
+    if (!initialize_calibration_watchdog()) {
+        printf("ERROR CALIBRATION WATCHDOG INIT\n");
+    }
 
     printf("\n");
     printf("SensorTrain Motor Controller\n");
