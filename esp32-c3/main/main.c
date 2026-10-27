@@ -58,6 +58,7 @@ typedef struct {
 
     int battery_percent;
     int applied_speed;
+    bool motor_port0_present;
 } sensortrain_hub_state_t;
 
 static sensortrain_hub_state_t
@@ -930,6 +931,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             hub->notifications_ready = false;
             hub->battery_percent = -1;
             hub->applied_speed = 0;
+            hub->motor_port0_present = false;
 
             /*
              * Stop the other reachable motor whenever
@@ -1073,6 +1075,59 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
              * [4] attach event
              */
             if (len >= 5 && data[2] == 0x04) {
+
+                /*
+                 * SENSORTRAIN_V12_CALIBRATION_PREFLIGHT
+                 *
+                 * Port 0 attachment:
+                 * Event 0 = detached
+                 * Event 1 = attached
+                 * Type 0x0002 = System Train Motor
+                 *
+                 * Unknown attachments fail closed.
+                 */
+                if (data[3] == 0) {
+
+                    bool train_motor = false;
+
+                    if (data[4] == 0x01 && len >= 7) {
+
+                        uint16_t type =
+                            data[5] |
+                            ((uint16_t)data[6] << 8);
+
+                        train_motor = (type == 0x0002);
+                    }
+
+                    /*
+                     * SENSORTRAIN_V12_MOTOR_DETACH_FAILSAFE
+                     *
+                     * A previously attached motor has
+                     * disappeared. Stop every reachable hub.
+                     */
+                    bool motor_was_present =
+                        hub->motor_port0_present;
+
+                    hub->motor_port0_present = train_motor;
+
+                    printf(
+                        "%s: MOTOR PORT0=%s\n",
+                        hub->config->role,
+                        train_motor ? "DETECTED" : "NOT_DETECTED"
+                    );
+
+                    if (motor_was_present && !train_motor) {
+
+                        printf(
+                            "%s: SAFETY MOTOR DETACH DETECTED\n",
+                            hub->config->role
+                        );
+
+                        stop_all_connected_motors(
+                            "MOTOR PORT0 DETACHED"
+                        );
+                    }
+                }
 
                 printf("ATTACHED-I/O: PORT=%u EVENT=%u",
                        data[3],
@@ -1388,72 +1443,13 @@ static bool send_motor_power_to_hub(
 }
 
 
-static bool lego_set_power(int power)
-{
-    /*
-     * SENSORTRAIN_V12_MOTION_INTERLOCK
-     *
-     * Temporary development safety interlock.
-     * Do not permit movement until BOTH hub connections,
-     * motor directions, and coordinated stop behavior
-     * are implemented and validated.
-     *
-     * Zero-power STOP commands remain permitted.
-     */
-    if (power != 0) {
-        printf("ERROR DUAL_MOTOR_CONTROL_NOT_READY\n");
-        return false;
-    }
-
-    if (!hub_connected || !lego_gatt_ready) {
-        printf("ERROR HUB NOT READY\n");
-        return false;
-    }
-
-    if (power < -100 || power > 100) {
-        printf("ERROR POWER RANGE\n");
-        return false;
-    }
-
-    /*
-     * LEGO Port Output Command:
-     *
-     * 08 = message length
-     * 00 = hub ID
-     * 81 = Port Output Command
-     * 00 = motor port 0
-     * 11 = execute immediately + feedback
-     * 51 = WriteDirectModeData
-     * 00 = motor power mode
-     * XX = power (-100..100)
-     */
-    uint8_t command[8] = {
-        0x08,
-        0x00,
-        0x81,
-        0x00,
-        0x11,
-        0x51,
-        0x00,
-        (uint8_t)(int8_t)power
-    };
-
-    int rc = ble_gattc_write_flat(
-        hub_conn_handle,
-        lego_characteristic_handle,
-        command,
-        sizeof(command),
-        motor_write_cb,
-        NULL
-    );
-
-    if (rc != 0) {
-        printf("ERROR MOTOR WRITE START rc=%d\n", rc);
-        return false;
-    }
-
-    return true;
-}
+/*
+ * SENSORTRAIN_V12_MOTION_INTERLOCK
+ *
+ * Legacy single-hub power output removed.
+ * send_motor_power_to_hub() rejects nonzero power.
+ * The coordinated speed planner remains locked.
+ */
 
 
 /*
@@ -1624,6 +1620,43 @@ static void process_command(const char *line)
         );
     }
 
+    else if (strcmp(line, "CALSTATUS") == 0) {
+
+        bool precheck = (requested_speed == 0);
+
+        for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+            const sensortrain_hub_state_t *hub =
+                &hub_states[i];
+
+            bool link_ready =
+                hub->connected &&
+                hub->gatt_ready &&
+                hub->notifications_ready &&
+                hub->characteristic_handle != 0;
+
+            bool motor_ready =
+                link_ready && hub->motor_port0_present;
+
+            if (!motor_ready) {
+                precheck = false;
+            }
+
+            printf(
+                "CALSTATUS %s LINK=%s MOTOR0=%s BATTERY=%d\n",
+                hub->config->role,
+                link_ready ? "READY" : "NOT_READY",
+                hub->motor_port0_present ? "YES" : "NO",
+                hub->battery_percent
+            );
+        }
+
+        printf(
+            "CALSTATUS PRECHECK=%s MOTION=LOCKED\n",
+            precheck ? "YES" : "NO"
+        );
+    }
+
     else if (strcmp(line, "SCAN") == 0) {
 
         start_ble_scan();
@@ -1636,18 +1669,11 @@ static void process_command(const char *line)
 
     else if (strcmp(line, "MOTORTEST") == 0) {
 
-        printf("MOTOR TEST: 20%% FOR 1 SECOND\n");
-
-        if (lego_set_power(20)) {
-
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            lego_set_power(0);
-
-            requested_speed = 0;
-
-            printf("MOTOR TEST COMPLETE\n");
-        }
+        /*
+         * Legacy single-hub test permanently disabled.
+         * Future calibration uses a separate controlled path.
+         */
+        printf("ERROR MOTORTEST_DISABLED\n");
     }
 
     else if (strcmp(line, "STOP") == 0) {
