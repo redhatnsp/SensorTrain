@@ -1553,10 +1553,36 @@ static atomic_bool cal_watchdog_expired =
 static atomic_bool cal_watchdog_test_used =
     ATOMIC_VAR_INIT(false);
 
+/*
+ * SENSORTRAIN_V12_CAL_TIMING_V1
+ *
+ * On-device monotonic timing measurements.
+ * Read-only diagnostics; no movement enabled.
+ */
+static atomic_uint cal_timing_arm_us =
+    ATOMIC_VAR_INIT(0);
+
+static atomic_uint cal_timing_callback_us =
+    ATOMIC_VAR_INIT(0);
+
+static atomic_uint cal_timing_task_us =
+    ATOMIC_VAR_INIT(0);
+
+static atomic_uint cal_timing_stop_us =
+    ATOMIC_VAR_INIT(0);
+
+static atomic_bool cal_timing_ready =
+    ATOMIC_VAR_INIT(false);
+
 
 static void cal_watchdog_timer_cb(void *arg)
 {
     (void)arg;
+
+    atomic_store(
+        &cal_timing_callback_us,
+        (unsigned int)esp_timer_get_time()
+    );
 
     atomic_store(&cal_watchdog_expired, true);
 
@@ -1577,6 +1603,11 @@ static void cal_watchdog_safety_task(void *arg)
         if (atomic_exchange(
                 &cal_watchdog_expired, false)) {
 
+            atomic_store(
+                &cal_timing_task_us,
+                (unsigned int)esp_timer_get_time()
+            );
+
             latch_safety_fault(
                 "CALIBRATION WATCHDOG EXPIRED"
             );
@@ -1584,6 +1615,15 @@ static void cal_watchdog_safety_task(void *arg)
             stop_all_connected_motors(
                 "CALIBRATION WATCHDOG EXPIRED"
             );
+
+            atomic_store(
+                &cal_timing_stop_us,
+                (unsigned int)esp_timer_get_time()
+            );
+
+            atomic_store(&cal_timing_ready, true);
+
+            printf("CALWATCHDOGTIMING RECORDED\n");
         }
     }
 }
@@ -1866,6 +1906,13 @@ static void process_command(const char *line)
              * Arm a 100 ms deadline for the self-test.
              * The safety task handles expiry separately.
              */
+            atomic_store(&cal_timing_ready, false);
+
+            atomic_store(
+                &cal_timing_arm_us,
+                (unsigned int)esp_timer_get_time()
+            );
+
             esp_err_t rc = esp_timer_start_once(
                 cal_watchdog_timer,
                 100000
@@ -1893,6 +1940,47 @@ static void process_command(const char *line)
                     "MOTION=LOCKED\n"
                 );
             }
+        }
+    }
+
+    else if (strcmp(line, "CALWATCHDOGTIMING") == 0) {
+
+        /*
+         * Read-only watchdog timing results.
+         *
+         * STOP_SUBMISSIONS means BLE write requests
+         * were processed, not physical motor stopping.
+         */
+        if (!atomic_load(&cal_timing_ready)) {
+
+            printf("CALWATCHDOGTIMING READY=NO\n");
+        }
+        else {
+
+            unsigned int arm =
+                atomic_load(&cal_timing_arm_us);
+
+            unsigned int callback =
+                atomic_load(&cal_timing_callback_us);
+
+            unsigned int task =
+                atomic_load(&cal_timing_task_us);
+
+            unsigned int stop =
+                atomic_load(&cal_timing_stop_us);
+
+            printf(
+                "CALWATCHDOGTIMING READY=YES "
+                "ARM_TO_CALLBACK_US=%u "
+                "CALLBACK_TO_TASK_US=%u "
+                "TASK_TO_STOP_SUBMISSIONS_US=%u "
+                "ARM_TO_STOP_SUBMISSIONS_US=%u "
+                "MOTION=LOCKED\n",
+                callback - arm,
+                task - callback,
+                stop - task,
+                stop - arm
+            );
         }
     }
 
