@@ -19,6 +19,7 @@
 #include "host/ble_gatt.h"
 #include "host/util/util.h"
 #include "os/os_mbuf.h"
+#include "sensortrain_hubs.h"
 
 static int requested_speed = 0;
 
@@ -29,6 +30,49 @@ static int64_t last_heartbeat_us = 0;
 
 static bool ble_ready = false;
 static uint8_t own_addr_type;
+
+/*
+ * SensorTrain v1.2 - independent hub runtime state.
+ *
+ * BLE connections, GATT handles, and battery
+ * information must never be shared between hubs.
+ */
+typedef struct {
+    const sensortrain_hub_config_t *config;
+
+    ble_addr_t address;
+
+    bool found;
+    bool connected;
+    bool connecting;
+
+    uint16_t conn_handle;
+
+    uint16_t service_start;
+    uint16_t service_end;
+    uint16_t characteristic_handle;
+    uint16_t cccd_handle;
+
+    bool gatt_ready;
+    bool notifications_ready;
+
+    int battery_percent;
+    int applied_speed;
+} sensortrain_hub_state_t;
+
+static sensortrain_hub_state_t
+    hub_states[SENSORTRAIN_HUB_COUNT];
+
+static void initialize_hub_states(void)
+{
+    memset(hub_states, 0, sizeof(hub_states));
+
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+        hub_states[i].config = &sensortrain_hub_configs[i];
+        hub_states[i].battery_percent = -1;
+        hub_states[i].applied_speed = 0;
+    }
+}
 
 static ble_addr_t hub_addr;
 static bool hub_found = false;
@@ -97,17 +141,38 @@ static void print_ble_addr(const ble_addr_t *addr)
  *   0x06 = Upstream Update
  * --------------------------------------------------------- */
 
+/*
+ * Validate the hub identity for asynchronous battery
+ * request callbacks.
+ */
+static bool battery_hub_valid(
+    uint16_t conn_handle,
+    const sensortrain_hub_state_t *hub)
+{
+    return hub != NULL &&
+           hub->connected &&
+           hub->conn_handle == conn_handle &&
+           hub->characteristic_handle != 0;
+}
+
+
 static int battery_request_write_cb(
     uint16_t conn_handle,
     const struct ble_gatt_error *error,
     struct ble_gatt_attr *attr,
     void *arg)
 {
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (!battery_hub_valid(conn_handle, hub)) {
+        printf("ERROR BATTERY REQUEST HUB MISMATCH\n");
+        return 0;
+    }
+
     if (error->status != 0) {
-        printf(
-            "ERROR BATTERY REQUEST WRITE status=%d\n",
-            error->status
-        );
+        printf("%s: ERROR BATTERY REQUEST status=%d\n",
+               hub->config->role, error->status);
     }
 
     return 0;
@@ -120,50 +185,51 @@ static int battery_enable_write_cb(
     struct ble_gatt_attr *attr,
     void *arg)
 {
-    if (error->status != 0) {
-        printf(
-            "ERROR BATTERY UPDATE ENABLE status=%d\n",
-            error->status
-        );
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
 
+    if (!battery_hub_valid(conn_handle, hub)) {
+        printf("ERROR BATTERY ENABLE HUB MISMATCH\n");
         return 0;
     }
 
-    printf("HUB BATTERY UPDATES ENABLED\n");
+    if (error->status != 0) {
+        printf("%s: ERROR BATTERY ENABLE status=%d\n",
+               hub->config->role, error->status);
+        return 0;
+    }
 
-    /*
-     * Immediately request the current value as well.  This
-     * avoids waiting for the battery percentage to change
-     * before the dashboard gets its first reading.
-     */
+    printf("%s: HUB BATTERY UPDATES ENABLED\n",
+           hub->config->role);
+
     uint8_t request_battery[] = {
         0x05, 0x00, 0x01, 0x06, 0x05
     };
 
     int rc = ble_gattc_write_flat(
         conn_handle,
-        lego_characteristic_handle,
+        hub->characteristic_handle,
         request_battery,
         sizeof(request_battery),
         battery_request_write_cb,
-        NULL
+        hub
     );
 
     if (rc != 0) {
-        printf(
-            "ERROR BATTERY REQUEST START rc=%d\n",
-            rc
-        );
+        printf("%s: ERROR BATTERY REQUEST START rc=%d\n",
+               hub->config->role, rc);
     }
 
     return 0;
 }
 
 
-static void enable_hub_battery_updates(void)
+static void enable_hub_battery_updates(
+    sensortrain_hub_state_t *hub)
 {
-    if (!hub_connected ||
-        lego_characteristic_handle == 0) {
+    if (hub == NULL ||
+        !hub->connected ||
+        hub->characteristic_handle == 0) {
 
         printf("ERROR BATTERY MONITOR NOT READY\n");
         return;
@@ -174,19 +240,17 @@ static void enable_hub_battery_updates(void)
     };
 
     int rc = ble_gattc_write_flat(
-        hub_conn_handle,
-        lego_characteristic_handle,
+        hub->conn_handle,
+        hub->characteristic_handle,
         enable_updates,
         sizeof(enable_updates),
         battery_enable_write_cb,
-        NULL
+        hub
     );
 
     if (rc != 0) {
-        printf(
-            "ERROR BATTERY UPDATE ENABLE START rc=%d\n",
-            rc
-        );
+        printf("%s: ERROR BATTERY ENABLE START rc=%d\n",
+               hub->config->role, rc);
     }
 }
 
@@ -197,16 +261,52 @@ static int notification_enable_cb(
     struct ble_gatt_attr *attr,
     void *arg)
 {
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (hub == NULL ||
+        !hub->connected ||
+        hub->conn_handle != conn_handle) {
+
+        printf("ERROR NOTIFICATION CALLBACK HUB MISMATCH\n");
+        return 0;
+    }
+
     if (error->status == 0) {
-        lego_notifications_ready = true;
 
-        printf("LEGO NOTIFICATIONS ENABLED\n");
+        hub->notifications_ready = true;
 
-        enable_hub_battery_updates();
-        printf("UNPLUG AND REPLUG THE TRAIN MOTOR NOW\n");
+        printf("%s: LEGO NOTIFICATIONS ENABLED\n",
+               hub->config->role);
+
+        if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+
+            /*
+             * Preserve the existing status protocol
+             * and locomotive battery monitoring.
+             */
+            lego_notifications_ready = true;
+
+            printf("LEGO NOTIFICATIONS ENABLED\n");
+
+            enable_hub_battery_updates(hub);
+
+            printf("UNPLUG AND REPLUG THE TRAIN MOTOR NOW\n");
+        }
+        else {
+            enable_hub_battery_updates(hub);
+        }
     }
     else {
-        printf("ERROR ENABLING NOTIFICATIONS status=%d\n",
+
+        hub->notifications_ready = false;
+
+        if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+            lego_notifications_ready = false;
+        }
+
+        printf("%s: ERROR ENABLING NOTIFICATIONS status=%d\n",
+               hub->config->role,
                error->status);
     }
 
@@ -221,6 +321,17 @@ static int descriptor_discovery_cb(
     const struct ble_gatt_dsc *dsc,
     void *arg)
 {
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (hub == NULL ||
+        !hub->connected ||
+        hub->conn_handle != conn_handle) {
+
+        printf("ERROR DESCRIPTOR CALLBACK HUB MISMATCH\n");
+        return 0;
+    }
+
     if (error->status == 0 && dsc != NULL) {
 
         if (ble_uuid_cmp(
@@ -228,10 +339,16 @@ static int descriptor_discovery_cb(
                 BLE_UUID16_DECLARE(
                     BLE_GATT_DSC_CLT_CFG_UUID16)) == 0) {
 
-            lego_cccd_handle = dsc->handle;
+            hub->cccd_handle = dsc->handle;
 
-            printf("LEGO CCCD FOUND handle=%u\n",
-                   lego_cccd_handle);
+            /* Temporary locomotive compatibility. */
+            if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+                lego_cccd_handle = hub->cccd_handle;
+            }
+
+            printf("%s: LEGO CCCD FOUND handle=%u\n",
+                   hub->config->role,
+                   hub->cccd_handle);
         }
 
         return 0;
@@ -239,31 +356,35 @@ static int descriptor_discovery_cb(
 
     if (error->status == BLE_HS_EDONE) {
 
-        if (lego_cccd_handle == 0) {
-            printf("ERROR LEGO_CCCD_NOT_FOUND\n");
+        if (hub->cccd_handle == 0) {
+            printf("%s: ERROR LEGO_CCCD_NOT_FOUND\n",
+                   hub->config->role);
             return 0;
         }
 
-        uint8_t enable_notifications[2] = { 0x01, 0x00 };
+        uint8_t enable_notifications[2] = {
+            0x01, 0x00
+        };
 
         int rc = ble_gattc_write_flat(
             conn_handle,
-            lego_cccd_handle,
+            hub->cccd_handle,
             enable_notifications,
             sizeof(enable_notifications),
             notification_enable_cb,
-            NULL
+            hub
         );
 
         if (rc != 0) {
-            printf("ERROR CCCD_WRITE rc=%d\n", rc);
+            printf("%s: ERROR CCCD_WRITE rc=%d\n",
+                   hub->config->role, rc);
         }
 
         return 0;
     }
 
-    printf("ERROR DESCRIPTOR_DISCOVERY status=%d\n",
-           error->status);
+    printf("%s: ERROR DESCRIPTOR_DISCOVERY status=%d\n",
+           hub->config->role, error->status);
 
     return 0;
 }
@@ -275,45 +396,72 @@ static int characteristic_discovery_cb(
     const struct ble_gatt_chr *chr,
     void *arg)
 {
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (hub == NULL ||
+        !hub->connected ||
+        hub->conn_handle != conn_handle) {
+
+        printf("ERROR CHARACTERISTIC CALLBACK HUB MISMATCH\n");
+        return 0;
+    }
+
     if (error->status == 0 && chr != NULL) {
 
-        lego_characteristic_handle = chr->val_handle;
+        hub->characteristic_handle = chr->val_handle;
 
-        printf("LEGO CHARACTERISTIC FOUND handle=%u\n",
-               lego_characteristic_handle);
+        /* Temporary locomotive compatibility. */
+        if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+            lego_characteristic_handle =
+                hub->characteristic_handle;
+        }
+
+        printf("%s: LEGO CHARACTERISTIC FOUND handle=%u\n",
+               hub->config->role,
+               hub->characteristic_handle);
 
         return 0;
     }
 
     if (error->status == BLE_HS_EDONE) {
 
-        if (lego_characteristic_handle == 0) {
-            printf("ERROR LEGO_CHARACTERISTIC_NOT_FOUND\n");
+        if (hub->characteristic_handle == 0) {
+            printf("%s: ERROR LEGO_CHARACTERISTIC_NOT_FOUND\n",
+                   hub->config->role);
             return 0;
         }
 
-        lego_gatt_ready = true;
+        hub->gatt_ready = true;
 
-        printf("LEGO GATT READY\n");
-        printf("SEARCHING FOR NOTIFICATION DESCRIPTOR...\n");
+        if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+            lego_gatt_ready = true;
+        }
+
+        printf("%s: LEGO GATT READY\n",
+               hub->config->role);
+
+        printf("%s: SEARCHING FOR NOTIFICATION DESCRIPTOR...\n",
+               hub->config->role);
 
         int rc = ble_gattc_disc_all_dscs(
             conn_handle,
-            lego_characteristic_handle,
-            lego_service_end,
+            hub->characteristic_handle,
+            hub->service_end,
             descriptor_discovery_cb,
-            NULL
+            hub
         );
 
         if (rc != 0) {
-            printf("ERROR DESCRIPTOR_DISCOVERY_START rc=%d\n",
-                   rc);
+            printf("%s: ERROR DESCRIPTOR_DISCOVERY_START rc=%d\n",
+                   hub->config->role, rc);
         }
 
         return 0;
     }
 
-    printf("ERROR CHARACTERISTIC_DISCOVERY status=%d\n",
+    printf("%s: ERROR CHARACTERISTIC_DISCOVERY status=%d\n",
+           hub->config->role,
            error->status);
 
     return 0;
@@ -326,71 +474,124 @@ static int service_discovery_cb(
     const struct ble_gatt_svc *service,
     void *arg)
 {
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    if (hub == NULL ||
+        !hub->connected ||
+        hub->conn_handle != conn_handle) {
+
+        printf("ERROR SERVICE CALLBACK HUB MISMATCH\n");
+        return 0;
+    }
+
     if (error->status == 0 && service != NULL) {
 
-        lego_service_start = service->start_handle;
-        lego_service_end = service->end_handle;
+        hub->service_start = service->start_handle;
+        hub->service_end = service->end_handle;
 
-        printf("LEGO SERVICE FOUND start=%u end=%u\n",
-               lego_service_start,
-               lego_service_end);
+        /*
+         * Temporary locomotive compatibility.
+         */
+        if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+            lego_service_start = hub->service_start;
+            lego_service_end = hub->service_end;
+        }
+
+        printf(
+            "%s: LEGO SERVICE FOUND start=%u end=%u\n",
+            hub->config->role,
+            hub->service_start,
+            hub->service_end
+        );
 
         return 0;
     }
 
     if (error->status == BLE_HS_EDONE) {
 
-        if (lego_service_start == 0) {
-            printf("ERROR LEGO_SERVICE_NOT_FOUND\n");
+        if (hub->service_start == 0) {
+            printf("%s: ERROR LEGO_SERVICE_NOT_FOUND\n",
+                   hub->config->role);
             return 0;
         }
 
-        printf("SEARCHING FOR LEGO CHARACTERISTIC...\n");
+        printf("%s: SEARCHING FOR LEGO CHARACTERISTIC...\n",
+               hub->config->role);
 
         int rc = ble_gattc_disc_chrs_by_uuid(
             conn_handle,
-            lego_service_start,
-            lego_service_end,
+            hub->service_start,
+            hub->service_end,
             &lego_characteristic_uuid.u,
             characteristic_discovery_cb,
-            NULL
+            hub
         );
 
         if (rc != 0) {
-            printf("ERROR CHARACTERISTIC_DISCOVERY_START rc=%d\n",
-                   rc);
+            printf(
+                "%s: ERROR CHARACTERISTIC_DISCOVERY_START rc=%d\n",
+                hub->config->role, rc
+            );
         }
 
         return 0;
     }
 
-    printf("ERROR SERVICE_DISCOVERY status=%d\n",
-           error->status);
+    printf("%s: ERROR SERVICE_DISCOVERY status=%d\n",
+           hub->config->role, error->status);
 
     return 0;
 }
 
 
-static void start_lego_gatt_discovery(void)
+static void start_lego_gatt_discovery(
+    sensortrain_hub_state_t *hub)
 {
-    lego_service_start = 0;
-    lego_service_end = 0;
-    lego_characteristic_handle = 0;
-    lego_cccd_handle = 0;
-    lego_gatt_ready = false;
-    lego_notifications_ready = false;
+    if (hub == NULL || !hub->connected) {
+        printf("ERROR GATT_DISCOVERY_NO_CONNECTED_HUB\n");
+        return;
+    }
 
-    printf("SEARCHING FOR LEGO SERVICE...\n");
+    /*
+     * Reset only this hub's discovery state.
+     */
+    hub->service_start = 0;
+    hub->service_end = 0;
+    hub->characteristic_handle = 0;
+    hub->cccd_handle = 0;
+    hub->gatt_ready = false;
+    hub->notifications_ready = false;
+
+    /*
+     * Temporary compatibility with the existing
+     * locomotive-only GATT callbacks.
+     *
+     * These shared variables will be removed as the
+     * remaining callbacks are migrated.
+     */
+    if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+        lego_service_start = 0;
+        lego_service_end = 0;
+        lego_characteristic_handle = 0;
+        lego_cccd_handle = 0;
+        lego_gatt_ready = false;
+        lego_notifications_ready = false;
+    }
+
+    printf("%s: SEARCHING FOR LEGO SERVICE...\n",
+           hub->config->role);
 
     int rc = ble_gattc_disc_svc_by_uuid(
-        hub_conn_handle,
+        hub->conn_handle,
         &lego_service_uuid.u,
         service_discovery_cb,
-        NULL
+        hub
     );
 
     if (rc != 0) {
-        printf("ERROR SERVICE_DISCOVERY_START rc=%d\n", rc);
+        printf("%s: ERROR SERVICE_DISCOVERY_START rc=%d\n",
+               hub->config->role, rc);
     }
 }
 
@@ -401,9 +602,32 @@ static void start_lego_gatt_discovery(void)
  * --------------------------------------------------------- */
 
 static void start_ble_scan(void);
-static void connect_to_hub(void);
+static void stop_all_connected_motors(const char *reason);
+static void connect_to_configured_hub(sensortrain_hub_id_t id);
 
 static bool auto_scan_task_pending = false;
+
+static bool any_hub_missing(void)
+{
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+        if (!hub_states[i].connected &&
+            !hub_states[i].connecting) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool connection_in_progress(void)
+{
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+        if (hub_states[i].connecting) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 static void auto_scan_task(void *arg)
 {
@@ -416,11 +640,11 @@ static void auto_scan_task(void *arg)
     auto_scan_task_pending = false;
 
     if (ble_ready &&
-        !hub_connected &&
-        !hub_connecting &&
+        any_hub_missing() &&
+        !connection_in_progress() &&
         !ble_gap_disc_active()) {
 
-        printf("AUTO: SEARCHING FOR HUB NO.4...\n");
+        printf("AUTO: SEARCHING FOR SENSORTRAIN HUBS...\n");
         start_ble_scan();
     }
 
@@ -430,8 +654,8 @@ static void auto_scan_task(void *arg)
 static void schedule_auto_scan(void)
 {
     if (auto_scan_task_pending ||
-        hub_connected ||
-        hub_connecting) {
+        !any_hub_missing() ||
+        connection_in_progress()) {
 
         return;
     }
@@ -473,23 +697,36 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                        fields.name_len,
                        (const char *)fields.name);
 
-                static const uint8_t target_hub_addr[6] = {
-                    0xA8, 0xD2, 0x01,
-                    0xC0, 0x9A, 0x9C
-                };
+                const sensortrain_hub_config_t *loco =
+                    &sensortrain_hub_configs[HUB_LOCOMOTIVE];
+                const sensortrain_hub_config_t *cab =
+                    &sensortrain_hub_configs[HUB_CABOOSE];
 
-                bool name_matches =
-                    fields.name_len == strlen("HUB NO.4") &&
-                    memcmp(fields.name,
-                           "HUB NO.4",
+                bool loco_name =
+                    fields.name_len == strlen(loco->name) &&
+                    memcmp(fields.name, loco->name,
                            fields.name_len) == 0;
 
-                bool address_matches =
-                    memcmp(event->disc.addr.val,
-                           target_hub_addr,
-                           sizeof(target_hub_addr)) == 0;
+                bool cab_name =
+                    fields.name_len == strlen(cab->name) &&
+                    memcmp(fields.name, cab->name,
+                           fields.name_len) == 0;
 
-                if (name_matches && address_matches) {
+                bool locomotive_matches =
+                    loco_name &&
+                    memcmp(event->disc.addr.val,
+                           loco->address, 6) == 0;
+
+                bool caboose_matches =
+                    cab_name &&
+                    memcmp(event->disc.addr.val,
+                           cab->address, 6) == 0;
+
+                if (locomotive_matches) {
+
+                    hub_states[HUB_LOCOMOTIVE].address =
+                        event->disc.addr;
+                    hub_states[HUB_LOCOMOTIVE].found = true;
 
                     memcpy(&hub_addr,
                            &event->disc.addr,
@@ -497,21 +734,44 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
                     hub_found = true;
 
-                    printf("  <-- SENSORTRAIN HUB");
+                    printf("  <-- ST-LOCOMOTIVE");
 
                     /*
                      * We found the one specific SensorTrain hub.
                      * Stop scanning and connect automatically.
                      */
-                    if (ble_gap_disc_active()) {
-                        ble_gap_disc_cancel();
+                    if (!hub_states[HUB_LOCOMOTIVE].connected &&
+                        !hub_states[HUB_LOCOMOTIVE].connecting) {
+
+                        if (ble_gap_disc_active()) {
+                            ble_gap_disc_cancel();
+                        }
+
+                        connect_to_configured_hub(HUB_LOCOMOTIVE);
                     }
-
-                    connect_to_hub();
                 }
-                else if (name_matches) {
+                else if (caboose_matches) {
 
-                    printf("  <-- HUB NO.4 IGNORED");
+                    hub_states[HUB_CABOOSE].address =
+                        event->disc.addr;
+                    hub_states[HUB_CABOOSE].found = true;
+
+                    if (!hub_states[HUB_CABOOSE].connected &&
+                        !hub_states[HUB_CABOOSE].connecting &&
+                        !connection_in_progress()) {
+
+                        printf("  <-- ST-CABOOSE CONNECTING");
+
+                        connect_to_configured_hub(HUB_CABOOSE);
+                    }
+                    else {
+
+                        printf("  <-- ST-CABOOSE DISCOVERED");
+                    }
+                }
+                else if (loco_name || cab_name) {
+
+                    printf("  <-- NAME/ADDRESS MISMATCH");
                 }
             }
 
@@ -524,9 +784,8 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
             printf("SCAN COMPLETE\n");
 
-            if (!hub_connected &&
-                !hub_connecting &&
-                !hub_found) {
+            if (any_hub_missing() &&
+                !connection_in_progress()) {
 
                 schedule_auto_scan();
             }
@@ -534,63 +793,210 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             break;
 
 
-        case BLE_GAP_EVENT_CONNECT:
+        case BLE_GAP_EVENT_CONNECT: {
+
+            sensortrain_hub_state_t *hub =
+                (sensortrain_hub_state_t *)arg;
+
+            /*
+             * Accept only our two configured hub contexts.
+             */
+            if (hub != &hub_states[HUB_LOCOMOTIVE] &&
+                hub != &hub_states[HUB_CABOOSE]) {
+
+                printf("ERROR UNEXPECTED CONNECTION CONTEXT\n");
+
+                if (event->connect.status == 0) {
+                    ble_gap_terminate(
+                        event->connect.conn_handle,
+                        BLE_ERR_REM_USER_CONN_TERM
+                    );
+                }
+
+                break;
+            }
+
+            hub->connecting = false;
 
             if (event->connect.status == 0) {
 
-                hub_connecting = false;
-                hub_connected = true;
-                hub_conn_handle =
+                hub->connected = true;
+                hub->conn_handle =
                     event->connect.conn_handle;
 
-                printf("HUB CONNECTED handle=%d\n",
-                       hub_conn_handle);
+                /*
+                 * Temporary compatibility with the
+                 * existing locomotive motor protocol.
+                 */
+                if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+                    hub_connecting = false;
+                    hub_connected = true;
+                    hub_conn_handle = hub->conn_handle;
+                }
 
-                start_lego_gatt_discovery();
+                printf("%s: HUB CONNECTED handle=%u\n",
+                       hub->config->role,
+                       hub->conn_handle);
+
+                if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+                    printf("HUB CONNECTED handle=%u\n",
+                           hub->conn_handle);
+                }
+
+                start_lego_gatt_discovery(hub);
+
+                /*
+                 * Continue discovering any missing hub.
+                 */
+                schedule_auto_scan();
             }
             else {
 
+                hub->connected = false;
+                hub->found = false;
+                hub->conn_handle = 0;
+                hub->gatt_ready = false;
+                hub->notifications_ready = false;
+                hub->battery_percent = -1;
+                hub->applied_speed = 0;
+
+                printf("%s: HUB CONNECTION FAILED status=%d\n",
+                       hub->config->role,
+                       event->connect.status);
+
+                if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+
+                    hub_connecting = false;
+                    hub_connected = false;
+                    hub_found = false;
+
+                    schedule_auto_scan();
+                }
+
+                /*
+                 * Failed caboose connection: require a
+                 * fresh movement command and retry discovery.
+                 */
+                requested_speed = 0;
+                schedule_auto_scan();
+            }
+
+            break;
+        }
+
+
+        case BLE_GAP_EVENT_DISCONNECT: {
+
+            uint16_t lost_handle =
+                event->disconnect.conn.conn_handle;
+
+            sensortrain_hub_state_t *hub = NULL;
+
+            /*
+             * Identify the disconnected hub by its actual
+             * BLE connection handle, not its advertised name.
+             */
+            for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+                if (hub_states[i].connected &&
+                    hub_states[i].conn_handle == lost_handle) {
+
+                    hub = &hub_states[i];
+                    break;
+                }
+            }
+
+            if (hub == NULL) {
+                printf("UNTRACKED HUB DISCONNECT handle=%u\n",
+                       lost_handle);
+                break;
+            }
+
+            printf("%s DISCONNECTED handle=%u reason=%d\n",
+                   hub->config->role,
+                   lost_handle,
+                   event->disconnect.reason);
+
+            hub->connected = false;
+            hub->connecting = false;
+            hub->found = false;
+            hub->conn_handle = 0;
+
+            hub->service_start = 0;
+            hub->service_end = 0;
+            hub->characteristic_handle = 0;
+            hub->cccd_handle = 0;
+
+            hub->gatt_ready = false;
+            hub->notifications_ready = false;
+            hub->battery_percent = -1;
+            hub->applied_speed = 0;
+
+            /*
+             * Stop the other reachable motor whenever
+             * either connection is lost.
+             */
+            stop_all_connected_motors("BLE HUB DISCONNECTED");
+
+            if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+
+                /*
+                 * Preserve the existing locomotive recovery
+                 * and zero-speed-on-reconnect behavior.
+                 */
                 hub_connecting = false;
                 hub_connected = false;
                 hub_found = false;
 
-                printf("HUB CONNECTION FAILED status=%d\n",
-                       event->connect.status);
+                lego_gatt_ready = false;
+                lego_notifications_ready = false;
+                hub_battery_percent = -1;
+
+                requested_speed = 0;
+
+                printf("HUB DISCONNECTED reason=%d\n",
+                       event->disconnect.reason);
+
+                printf("AUTO: WILL SEARCH FOR HUB AGAIN\n");
+                schedule_auto_scan();
+            }
+            else {
+                /*
+                 * Reconnect at zero requested speed.
+                 * Physical stop-both behavior must be
+                 * implemented before movement is enabled.
+                 */
+                requested_speed = 0;
+
+                printf("CABOOSE DISCONNECTED - RECONNECTING\n");
 
                 schedule_auto_scan();
             }
 
             break;
-
-
-        case BLE_GAP_EVENT_DISCONNECT:
-
-            hub_connecting = false;
-            hub_connected = false;
-            hub_found = false;
-
-            lego_gatt_ready = false;
-            lego_notifications_ready = false;
-
-            hub_battery_percent = -1;
-
-            /*
-             * Never resume the previous motor speed after
-             * reconnecting.
-             */
-            requested_speed = 0;
-
-            printf("HUB DISCONNECTED reason=%d\n",
-                   event->disconnect.reason);
-
-            printf("AUTO: WILL SEARCH FOR HUB AGAIN\n");
-
-            schedule_auto_scan();
-
-            break;
+        }
 
 
         case BLE_GAP_EVENT_NOTIFY_RX: {
+
+            uint16_t notify_handle =
+                event->notify_rx.conn_handle;
+
+            sensortrain_hub_state_t *hub = NULL;
+
+            for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+                if (hub_states[i].connected &&
+                    hub_states[i].conn_handle == notify_handle) {
+
+                    hub = &hub_states[i];
+                    break;
+                }
+            }
+
+            if (hub == NULL) {
+                printf("ERROR NOTIFICATION UNKNOWN HUB handle=%u\n",
+                       notify_handle);
+                break;
+            }
 
             int len =
                 OS_MBUF_PKTLEN(event->notify_rx.om);
@@ -627,12 +1033,24 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                 int value = (int)data[5];
 
                 if (value >= 0 && value <= 100) {
-                    hub_battery_percent = value;
 
-                    printf(
-                        "HUB BATTERY %d%%\n",
-                        hub_battery_percent
-                    );
+                    hub->battery_percent = value;
+
+                    if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+
+                        /*
+                         * Retain the existing Pi motor
+                         * bridge battery message format.
+                         */
+                        hub_battery_percent = value;
+
+                        printf("HUB BATTERY %d%%\n", value);
+                    }
+                    else {
+
+                        printf("CABOOSE BATTERY %d%%\n",
+                               value);
+                    }
                 }
             }
 
@@ -709,6 +1127,10 @@ static void start_ble_scan(void)
 
     hub_found = false;
 
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+        hub_states[i].found = false;
+    }
+
     struct ble_gap_disc_params params = {0};
 
     params.passive = 0;
@@ -733,20 +1155,32 @@ static void start_ble_scan(void)
 }
 
 
-static void connect_to_hub(void)
+static void connect_to_configured_hub(
+    sensortrain_hub_id_t id)
 {
+    if (id < 0 || id >= SENSORTRAIN_HUB_COUNT) {
+        printf("ERROR INVALID_HUB_ID\n");
+        return;
+    }
+
+    sensortrain_hub_state_t *hub = &hub_states[id];
+
     if (!ble_ready) {
         printf("ERROR BLE_NOT_READY\n");
         return;
     }
 
-    if (hub_connected) {
-        printf("HUB ALREADY CONNECTED\n");
+    if (hub->connected || hub->connecting ||
+        connection_in_progress()) {
+
+        printf("%s: ALREADY CONNECTED OR CONNECTING\n",
+               hub->config->role);
         return;
     }
 
-    if (!hub_found) {
-        printf("ERROR HUB_NOT_FOUND - RUN SCAN FIRST\n");
+    if (!hub->found) {
+        printf("%s: NOT FOUND - SCAN FIRST\n",
+               hub->config->role);
         return;
     }
 
@@ -754,25 +1188,37 @@ static void connect_to_hub(void)
         ble_gap_disc_cancel();
     }
 
-    printf("CONNECTING TO HUB...\n");
+    printf("%s: CONNECTING...\n",
+           hub->config->role);
 
-    hub_connecting = true;
+    hub->connecting = true;
+
+    /* Preserve legacy status only for the locomotive. */
+    if (id == HUB_LOCOMOTIVE) {
+        hub_connecting = true;
+    }
 
     int rc = ble_gap_connect(
         own_addr_type,
-        &hub_addr,
+        &hub->address,
         30000,
         NULL,
         ble_gap_event,
-        NULL
+        hub
     );
 
     if (rc != 0) {
 
-        hub_connecting = false;
-        hub_found = false;
+        hub->connecting = false;
+        hub->found = false;
 
-        printf("ERROR CONNECT_START rc=%d\n", rc);
+        if (id == HUB_LOCOMOTIVE) {
+            hub_connecting = false;
+            hub_found = false;
+        }
+
+        printf("%s: ERROR CONNECT_START rc=%d\n",
+               hub->config->role, rc);
 
         schedule_auto_scan();
     }
@@ -839,6 +1285,21 @@ static int motor_write_cb(
 
 static bool lego_set_power(int power)
 {
+    /*
+     * SENSORTRAIN_V12_MOTION_INTERLOCK
+     *
+     * Temporary development safety interlock.
+     * Do not permit movement until BOTH hub connections,
+     * motor directions, and coordinated stop behavior
+     * are implemented and validated.
+     *
+     * Zero-power STOP commands remain permitted.
+     */
+    if (power != 0) {
+        printf("ERROR DUAL_MOTOR_CONTROL_NOT_READY\n");
+        return false;
+    }
+
     if (!hub_connected || !lego_gatt_ready) {
         printf("ERROR HUB NOT READY\n");
         return false;
@@ -889,6 +1350,58 @@ static bool lego_set_power(int power)
     return true;
 }
 
+
+/*
+ * SENSORTRAIN_V12_COORDINATED_STOP
+ *
+ * Send zero power to every connected, GATT-ready hub.
+ * Submission is not proof of physical motor stoppage.
+ */
+static void stop_all_connected_motors(const char *reason)
+{
+    requested_speed = 0;
+
+    printf("SAFETY STOP: %s\n", reason);
+
+    for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+        sensortrain_hub_state_t *hub = &hub_states[i];
+
+        if (!hub->connected ||
+            !hub->gatt_ready ||
+            hub->characteristic_handle == 0) {
+
+            printf("%s: STOP UNAVAILABLE - HUB NOT READY\n",
+                   hub->config->role);
+            continue;
+        }
+
+        uint8_t command[8] = {
+            0x08, 0x00, 0x81, 0x00,
+            0x11, 0x51, 0x00, 0x00
+        };
+
+        int rc = ble_gattc_write_flat(
+            hub->conn_handle,
+            hub->characteristic_handle,
+            command,
+            sizeof(command),
+            motor_write_cb,
+            hub
+        );
+
+        if (rc != 0) {
+            printf("%s: ERROR STOP SUBMISSION rc=%d\n",
+                   hub->config->role, rc);
+        }
+        else {
+            printf("%s: STOP COMMAND SUBMITTED\n",
+                   hub->config->role);
+        }
+    }
+}
+
+
 static void process_command(const char *line)
 {
     if (strcmp(line, "PING") == 0) {
@@ -918,7 +1431,7 @@ static void process_command(const char *line)
 
     else if (strcmp(line, "CONNECT") == 0) {
 
-        connect_to_hub();
+        connect_to_configured_hub(HUB_LOCOMOTIVE);
     }
 
     else if (strcmp(line, "MOTORTEST") == 0) {
@@ -939,10 +1452,8 @@ static void process_command(const char *line)
 
     else if (strcmp(line, "STOP") == 0) {
 
-        if (lego_set_power(0)) {
-            requested_speed = 0;
-            printf("STOPPED\n");
-        }
+        stop_all_connected_motors("HOST STOP");
+        printf("STOPPED\n");
     }
 
     else if (strncmp(line, "SPEED ", 6) == 0) {
@@ -976,6 +1487,8 @@ static void process_command(const char *line)
 void app_main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    initialize_hub_states();
 
     esp_err_t ret = nvs_flash_init();
 
@@ -1012,7 +1525,7 @@ void app_main(void)
          * If motor is running and the Pi stops sending
          * heartbeats for 1 second, stop immediately.
          */
-        if (requested_speed != 0 && hub_connected) {
+        if (requested_speed != 0) {
 
             int64_t now = esp_timer_get_time();
 
@@ -1021,8 +1534,8 @@ void app_main(void)
 
                 printf("\nFAILSAFE: HEARTBEAT LOST - STOPPING MOTOR\n");
 
-                lego_set_power(0);
-                requested_speed = 0;
+                stop_all_connected_motors(
+                    "HEARTBEAT TIMEOUT");
             }
         }
 
