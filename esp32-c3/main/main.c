@@ -86,6 +86,22 @@ typedef struct {
 static sensortrain_hub_state_t
     hub_states[SENSORTRAIN_HUB_COUNT];
 
+/*
+ * SENSORTRAIN_V12_STOP_OUTCOME_V1
+ *
+ * Aggregate BLE STOP diagnostics for each hub.
+ * All motor output remains zero-only.
+ *
+ * BLE_OK means the BLE write callback succeeded.
+ * It does NOT prove physical motor stoppage.
+ */
+static atomic_uint stop_attempts[SENSORTRAIN_HUB_COUNT];
+static atomic_uint stop_submitted[SENSORTRAIN_HUB_COUNT];
+static atomic_uint stop_ble_ok[SENSORTRAIN_HUB_COUNT];
+static atomic_uint stop_ble_failed[SENSORTRAIN_HUB_COUNT];
+static atomic_uint stop_submit_failed[SENSORTRAIN_HUB_COUNT];
+static atomic_uint stop_unavailable[SENSORTRAIN_HUB_COUNT];
+
 static void initialize_hub_states(void)
 {
     memset(hub_states, 0, sizeof(hub_states));
@@ -1406,6 +1422,64 @@ static int motor_write_cb(
 }
 
 /*
+ * SENSORTRAIN_V12_STOP_BLE_CALLBACK
+ *
+ * Count BLE results for zero-power STOP commands.
+ * Do not recursively issue STOP from this callback.
+ */
+static int stop_write_cb(
+    uint16_t conn_handle,
+    const struct ble_gatt_error *error,
+    struct ble_gatt_attr *attr,
+    void *arg)
+{
+    sensortrain_hub_state_t *hub =
+        (sensortrain_hub_state_t *)arg;
+
+    int id = -1;
+
+    if (hub == &hub_states[HUB_LOCOMOTIVE]) {
+        id = HUB_LOCOMOTIVE;
+    }
+    else if (hub == &hub_states[HUB_CABOOSE]) {
+        id = HUB_CABOOSE;
+    }
+
+    if (id < 0) {
+        latch_safety_fault(
+            "STOP BLE CALLBACK UNKNOWN HUB"
+        );
+        printf("ERROR STOP BLE CALLBACK UNKNOWN HUB\n");
+        return 0;
+    }
+
+    if (error == NULL) {
+        atomic_fetch_add(&stop_ble_failed[id], 1);
+
+        latch_safety_fault(
+            "STOP BLE CALLBACK INVALID"
+        );
+
+        printf(
+            "%s: ERROR STOP BLE CALLBACK INVALID\n",
+            hub->config->role
+        );
+        return 0;
+    }
+
+    if (error->status == 0) {
+        atomic_fetch_add(&stop_ble_ok[id], 1);
+    }
+    else {
+        atomic_fetch_add(&stop_ble_failed[id], 1);
+    }
+
+    return motor_write_cb(
+        conn_handle, error, attr, arg
+    );
+}
+
+/*
  * SENSORTRAIN_V12_PER_HUB_MOTOR_OUTPUT
  *
  * Submit a motor command to one specific LEGO hub.
@@ -1466,7 +1540,7 @@ static bool send_motor_power_to_hub(
         hub->characteristic_handle,
         command,
         sizeof(command),
-        motor_write_cb,
+        power == 0 ? stop_write_cb : motor_write_cb,
         hub
     );
 
@@ -1507,9 +1581,17 @@ static void stop_all_connected_motors(const char *reason)
 
         sensortrain_hub_state_t *hub = &hub_states[i];
 
+        atomic_fetch_add(&stop_attempts[i], 1);
+
         if (!hub->connected ||
             !hub->gatt_ready ||
             hub->characteristic_handle == 0) {
+
+            atomic_fetch_add(&stop_unavailable[i], 1);
+
+            latch_safety_fault(
+                "STOP UNAVAILABLE - HUB NOT READY"
+            );
 
             printf("%s: STOP UNAVAILABLE - HUB NOT READY\n",
                    hub->config->role);
@@ -1518,10 +1600,14 @@ static void stop_all_connected_motors(const char *reason)
 
         if (send_motor_power_to_hub(hub, 0)) {
 
+            atomic_fetch_add(&stop_submitted[i], 1);
+
             printf("%s: STOP COMMAND SUBMITTED\n",
                    hub->config->role);
         }
         else {
+
+            atomic_fetch_add(&stop_submit_failed[i], 1);
 
             printf("%s: ERROR STOP SUBMISSION\n",
                    hub->config->role);
@@ -1783,6 +1869,34 @@ static void process_command(const char *line)
                 "READY" : "NOT_READY",
             hub_battery_percent
         );
+    }
+
+    else if (strcmp(line, "STOPSTATUS") == 0) {
+
+        /*
+         * Read-only aggregate STOP outcome counters.
+         * Callbacks can complete asynchronously.
+         */
+        for (int i = 0; i < SENSORTRAIN_HUB_COUNT; i++) {
+
+            printf(
+                "STOPSTATUS %s "
+                "ATTEMPTS=%u "
+                "SUBMITTED=%u "
+                "BLE_OK=%u "
+                "BLE_FAILED=%u "
+                "SUBMIT_FAILED=%u "
+                "UNAVAILABLE=%u "
+                "MOTION=LOCKED\n",
+                hub_states[i].config->role,
+                atomic_load(&stop_attempts[i]),
+                atomic_load(&stop_submitted[i]),
+                atomic_load(&stop_ble_ok[i]),
+                atomic_load(&stop_ble_failed[i]),
+                atomic_load(&stop_submit_failed[i]),
+                atomic_load(&stop_unavailable[i])
+            );
+        }
     }
 
     else if (strcmp(line, "SAFETYSTATUS") == 0) {
