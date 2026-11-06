@@ -15,6 +15,8 @@ from adafruit_bno08x import (
     BNO_REPORT_ROTATION_VECTOR,
 )
 from adafruit_bme280 import basic as adafruit_bme280
+import adafruit_ens160
+import adafruit_veml7700
 from adafruit_onewire.bus import OneWireBus
 import adafruit_ds18x20
 
@@ -23,7 +25,7 @@ import adafruit_ds18x20
 # SensorTrain Pico 2 telemetry firmware
 # ==================================================
 
-FIRMWARE_VERSION = "0.4.1"
+FIRMWARE_VERSION = "0.5.0"
 
 
 # Known DS18B20 ROM identities
@@ -76,6 +78,24 @@ try:
     )
 except Exception as exc:
     boot_errors.append("bme280_init:" + str(exc))
+
+
+# --------------------------------------------------
+# v0.5.0: ENS161 and VEML7700, shared I2C bus
+# Errors are isolated so existing sensors keep working.
+# --------------------------------------------------
+
+ens161 = None
+try:
+    ens161 = adafruit_ens160.ENS160(i2c, address=0x53)
+except Exception as exc:
+    boot_errors.append("ens161_init:" + str(exc))
+
+veml7700 = None
+try:
+    veml7700 = adafruit_veml7700.VEML7700(i2c, address=0x10)
+except Exception as exc:
+    boot_errors.append("veml7700_init:" + str(exc))
 
 
 # --------------------------------------------------
@@ -536,6 +556,35 @@ def emit_telemetry():
         except Exception as exc:
             errors.append("bme280_read:" + str(exc))
 
+    # ---------- Air quality and ambient light ----------
+    # These reads occur only in the existing 1-second telemetry
+    # cycle, never in the continuous wheel-sampling routine.
+
+    aqi = None
+    tvoc_ppb = None
+    eco2_ppm = None
+    lux = None
+
+    if ens161 is not None:
+        try:
+            if ambient_c is not None:
+                ens161.temperature_compensation = ambient_c
+            if humidity_pct is not None:
+                ens161.humidity_compensation = humidity_pct
+            aqi = int(ens161.AQI)
+            tvoc_ppb = int(ens161.TVOC)
+            eco2_ppm = int(ens161.eCO2)
+        except Exception as exc:
+            errors.append("ens161_read:" + str(exc))
+
+    if veml7700 is not None:
+        try:
+            # Use the non-blocking fixed-configuration lux property.
+            # autolux may adjust integration time and wait for samples.
+            lux = rounded(veml7700.lux, 1)
+        except Exception as exc:
+            errors.append("veml7700_read:" + str(exc))
+
     # ---------- Motion ----------
 
     accel_x = None
@@ -596,6 +645,16 @@ def emit_telemetry():
             "temperature_c": ambient_c,
             "humidity_pct": humidity_pct,
             "pressure_hpa": pressure_hpa,
+        },
+
+        "air_quality": {
+            "aqi": aqi,
+            "tvoc_ppb": tvoc_ppb,
+            "eco2_ppm": eco2_ppm,
+        },
+
+        "light": {
+            "lux": lux,
         },
 
         "temperatures": {

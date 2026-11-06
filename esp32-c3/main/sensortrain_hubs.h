@@ -31,13 +31,13 @@ sensortrain_hub_configs[SENSORTRAIN_HUB_COUNT] = {
         "LOCOMOTIVE",
         "ST-LOCOMOTIVE",
         {0xA8, 0xD2, 0x01, 0xC0, 0x9A, 0x9C},
-        0
+        1
     },
     {
         "CABOOSE",
         "ST-CABOOSE",
         {0xDD, 0xAB, 0xCD, 0x2B, 0x84, 0x90},
-        0
+        1
     }
 };
 
