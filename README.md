@@ -7,20 +7,36 @@ The Raspberry Pi 5 runs Red Hat Enterprise Linux 9.8 with the Red Hat build of M
 ## Hardware
 
 ### Compute
-- Raspberry Pi 5
-- Official Raspberry Pi 5 Active Cooler
-- 128 GB 2242 NVMe SSD
-- Raspberry Pi Pico 2 (non-W)
+- Raspberry Pi 5 - 8GB (https://www.microcenter.com/product/673711/raspberry-pi-5-8gb)
+- 52Pi M.2 NVMe / PoE+ Hat (https://www.microcenter.com/product/688932/52pi-m2-nvme-m-key-poe-hat-for-raspberry-pi-5)
+- Official Raspberry Pi 5 Active Cooler (https://www.microcenter.com/product/671930/raspberry-pi-5-active-cooler)
+- 128 GB 2242 NVMe SSD (https://a.co/d/0gFHPqWI)
+- Raspberry Pi Pico 2 (https://www.microcenter.com/product/683268/raspberry-pi-pico-2)
 
 ### Sensors
-- BNO085 IMU
-- BME280 environmental sensor
-- 2 x DS18B20 temperature sensors
-- Pololu QTR-HD-01RC wheel marker sensor
+- Adafruit BME280 environmental sensor (https://www.adafruit.com/product/2652)
+    - Temperature, Humidity, Barometric Pressure
+- Adafruit BNO085 Orientation IMU (https://www.adafruit.com/product/4754)
+    - Acceleration and Acceleration Vector
+    - Angular Velocity and Gyroscope
+    - 3 Axis Magentometer
+    - Linear Acceleration Vector
+    - Gravity Vector
+    - Rotation Vector
+- 2 x Adafruit DS18B20 temperature sensors (https://www.adafruit.com/product/374)
+    - 12 bit Precision Temperature
+- Adafruit VEML7700 Lux Sensor (https://www.adafruit.com/product/4162)
+    - 16 bit Precision Lux
+- Adafruit ENS161 MOX Gas Sensor (https://www.adafruit.com/product/6431)
+    - Air Quality Index
+    - eCO2
+    - TVOC
+- Pololu QTR-HD-01RC Reflectance Sensor (https://www.pololu.com/product/4101)
+    - IR LED Phototransistor
 
 ### Cooling
 - 2 x 30 mm fans
-- MOSFET fan drivers
+- 2x Adafruit MOSFET fan drivers (https://www.adafruit.com/product/5648)
 - PWM levels: 0%, 25%, 50%, 75%, 100%
 - 0.5-second full-power startup kick when starting at 25%
 
